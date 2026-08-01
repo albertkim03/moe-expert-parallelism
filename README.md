@@ -12,7 +12,7 @@ shared between processes and which do not.
 
 ```bash
 ./setup.sh      # makes .venv, installs torch (~200MB)
-./run.sh        # training demo + scaling analysis
+./run.sh        # the training demo
 ```
 
 Or the pieces separately:
@@ -20,7 +20,6 @@ Or the pieces separately:
 ```bash
 python train.py                  # 4 processes, 10 steps
 python train.py --ranks 8
-python bench.py                  # scaling numbers, no torch needed
 ```
 
 ## What you get
@@ -124,9 +123,8 @@ why the backward of one is the other.
 | `distributed.py` | `setup`/`cleanup`, `exchange_counts`, and `all_to_all`. Knows nothing about experts. |
 | `ep_moe.py` | The expert-parallel layer. Holds `E/P` experts, runs the seven steps above. Same input and output shape as `reference_moe.py`. |
 | `model.py` | Wraps an MoE layer and adds `Linear(d_model, 1)` so there is one number per token to train against. `make_batch` gives each process different data. |
-| `sync.py` | After `backward()`, all-reduces the gradients of everything not tagged `is_expert`. Eight lines. |
+| `sync.py` | After `backward()`, all-reduces the gradients of everything not tagged `is_expert`. A six-line loop. |
 | `train.py` | Spawns the processes, builds the model, checks it against the reference, trains, prints the evidence above. |
-| `bench.py` | Scaling arithmetic. No torch, no processes. |
 
 Read them in that order; each only depends on the ones above it.
 
