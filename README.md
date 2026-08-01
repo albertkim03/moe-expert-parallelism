@@ -23,16 +23,21 @@ python train.py --ranks 8
 python bench.py                  # scaling numbers, no torch needed
 ```
 
-`train.py` starts the processes itself with `mp.spawn`, so there is no `torchrun`
-to remember. Tested on macOS (aarch64) and it has no platform-specific code.
-
 ## What you get
 
 ```
-1. CORRECTNESS  (distributed vs single-process reference)
-  global batch          : (48, 16)  (12 tokens on each of 4 ranks)
-  max |distributed-ref| : 0.000e+00
-  allclose(atol=1e-5)   : True
+1. CORRECTNESS   (is the distributed version computing the right thing?)
+  Run the SAME batch through two implementations, then subtract.
+
+    input   48 token vectors, 16 numbers each   (12 tokens on each of 4 ranks)
+
+    A       reference_moe.py  — all 8 experts in ONE process
+    B       ep_moe.py         — 2 experts per rank, across 4 ranks
+
+  Each produces 48 x 16 = 768 numbers.
+
+    numbers that differ (A vs B) : 0 of 768
+    largest difference           : 0  (exact match)
 
 2. TRAINING  (one MoE layer, regressing a constant)
   step   0   loss 0.602845
@@ -50,9 +55,17 @@ to remember. Tested on macOS (aarch64) and it has no platform-specific code.
     rank 3: owns experts [6, 7]   expert fingerprint +7.785652
 ```
 
-The delta is exactly zero at 1, 2, 4 and 8 processes. It is compared with a
-tolerance rather than for equality because reordered floating-point sums differ in
-the last bits; here the order happens to match, so it comes out exact.
+Every one of the 768 numbers matches, at 1, 2, 4 and 8 processes.
+
+That comparison is the point of `reference_moe.py` existing. Get the distributed
+version wrong — send a token to the wrong process, or reassemble the answers in the
+wrong order — and you get plausible numbers in the wrong places. Same shape, same
+magnitude, no error raised, and the loss still falls. Subtracting against an
+implementation simple enough to verify by reading is the only way to see it.
+
+An exact match is slightly lucky. Floating-point addition is not associative, so
+summing the same values in a different order can differ in the last bits; here the
+order happens to line up. A difference of ~1e-6 would still be a pass.
 
 ## The layer, step by step
 

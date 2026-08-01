@@ -64,17 +64,27 @@ def correctness_check(cfg: MoEConfig, model, rank: int, world_size: int) -> None
         dist.all_gather_into_tensor(y_all, y_local.contiguous())
         expected, _ = reference(x_global)
 
-    delta = (y_all - expected).abs().max().item()
+    diff = (y_all - expected).abs()
+    largest = diff.max().item()
+    n_diff = int((diff > 0).sum())
+    total = diff.numel()
+
     if rank == 0:
+        per_rank = cfg.num_experts // world_size
         print("=" * 68)
-        print("1. CORRECTNESS  (distributed vs single-process reference)")
+        print("1. CORRECTNESS   (is the distributed version computing the right thing?)")
         print("=" * 68)
-        print(f"  global batch          : {tuple(x_global.shape)}  "
-              f"({T} tokens on each of {world_size} ranks)")
-        print(f"  max |distributed-ref| : {delta:.3e}")
-        print(f"  allclose(atol=1e-5)   : {torch.allclose(y_all, expected, atol=1e-5)}")
-        print("  -> identical output, but no rank held more than "
-              f"{cfg.num_experts // world_size} of {cfg.num_experts} experts.\n", flush=True)
+        print("  Run the SAME batch through two implementations, then subtract.\n")
+        print(f"    input   {world_size * T} token vectors, {cfg.d_model} numbers each"
+              f"   ({T} tokens on each of {world_size} ranks)\n")
+        print(f"    A       reference_moe.py  — all {cfg.num_experts} experts in ONE process")
+        print(f"    B       ep_moe.py         — {per_rank} experts per rank, across {world_size} ranks\n")
+        print(f"  Each produces {world_size * T} x {cfg.d_model} = {total} numbers.\n")
+        print(f"    numbers that differ (A vs B) : {n_diff} of {total}")
+        print(f"    largest difference           : "
+              f"{'0  (exact match)' if largest == 0 else f'{largest:.3e}'}\n")
+        print(f"  -> same answer, but no rank ever held more than {per_rank} of the "
+              f"{cfg.num_experts} experts.\n", flush=True)
 
 
 def worker(rank: int, world_size: int, args) -> None:
