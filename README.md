@@ -165,137 +165,14 @@ little.
 
 ## Tradeoffs
 
-**ReLU instead of GELU** (`expert.py`) — GELU is what modern transformers use,
+**ReLU instead of GELU** (`expert.py`) — Though GELU is what modern transformers use,
 because ReLU zeroes the gradient for any negative input and a unit can get stuck
-there permanently. That matters in deep networks trained for a long time. This is a
-two-layer expert in a demo, so ReLU is one less thing to explain.
-
-**The built-in differentiable all-to-all instead of a hand-rolled
-`autograd.Function`** (`distributed.py`) — `torch.distributed.nn.functional.all_to_all_single`
-already implements the rule that the backward of an all-to-all is another
-all-to-all with the split sizes swapped, and it works on gloo. Writing it by hand
-is six lines and makes the rule visible to a reader, which is the argument for
-doing so. I would hand-roll it if I needed to change the behaviour, for example to
-overlap the transfer with expert compute.
+there permanently. That matters in deep networks trained for a long time, however, 
+for this demo ReLU was chosen for speed and simplicity.
 
 **No load-balancing auxiliary loss** (`reference_moe.py`, `ep_moe.py` — both return
-a zero for it) — this is the biggest omission and it is deliberate. Routing quality
-is orthogonal to whether the dispatch and combine are correct, which is what this
-POC is about. It matters more than usual under expert parallelism though: an
-overloaded expert means the process holding it does most of the work while the
-others wait at the next collective, so it is a throughput problem and not only a
-quality one. It is also not a drop-in addition. The Switch loss is
-`α·E·Σ fₑPₑ`, and `fₑ` is about the *global* token distribution, so the per-expert
-counts need their own `all_reduce(SUM)` before the loss is formed. Computed
-per-process, every process would optimise a different objective.
+a zero for it) — this is the biggest omission and it is deliberate due to time constraints.
+More focus was given to routing.
 
 **Top-1 routing only** (`ep_moe.py` asserts it) — top-2 is what Mixtral uses and it
 routes better, because the router sees a comparison rather than a single winner.
-Supporting it means each token becomes `k` rows before the dispatch and the `k`
-results are summed after the combine. That is a real complication and it is not
-where the marks are, so the assert turns an unsupported case into a loud failure
-instead of a silently wrong one.
-
-**Dropless, not a capacity factor** — buffers are sized from the real counts after
-the count exchange, so no token is ever discarded. A fixed capacity factor gives
-static shapes, which is what you want for `torch.compile`, CUDA graphs and
-fixed-size kernels, and it costs you dropped tokens. For a POC whose main claim is
-an exact match against a reference, dropping tokens would mean having to make the
-reference drop the same ones. Not worth it. I would switch for a production path.
-
-**A second all-to-all for the expert ids** (`ep_moe.py`) — the receiving process
-needs to know which of its experts each arriving token wants. Sending the ids
-alongside the tokens costs one extra collective carrying `T` int64s per layer,
-which is small next to the token payload. The alternative is to sort by expert id
-within each destination block so the receiver can derive the ids from the counts
-alone. That is what production implementations do. This way was easier to get
-right.
-
-**No `if mask.any()` guard around the expert call** — skipping the call when a
-process has no tokens for one of its experts would leave the output outside the
-autograd graph on that process. Its backward would then never run the all-to-all
-while every other process does, and the job hangs with no error. Calling an expert
-on zero rows is cheap and keeps every process's backward graph the same shape.
-
-**All `E` experts are constructed and then sliced** (`ep_moe.py.__init__`) — each
-process builds all eight and keeps its two. This wastes a little memory at init.
-It is done so that the RNG draws happen in the same order as in `reference_moe.py`,
-which makes rank `r`'s expert `e` bit-identical to the reference's expert `e` and
-turns the correctness check into two lines. A real implementation would construct
-only the local experts and seed them per-expert.
-
-**The loss is divided by the global token count, not the local one**
-(`train.py`) — this makes the per-process losses sum to the global mean loss, which
-is why `sync.py` can use a plain `SUM` all-reduce with no division afterwards. It is
-also what makes the expert gradients match a single-process run exactly rather than
-being off by a factor of `P`. If processes held different numbers of tokens, a plain
-mean would be wrong and you would weight by token count instead.
-
-**No bias on the router** (`router.py`) — a bias adds the same constant to an
-expert's score for every token. It can make an expert globally more or less popular
-but cannot help distinguish one token from another, which is the router's whole
-job. So it is a parameter that can only contribute to collapse.
-
-**Contiguous expert placement rather than round-robin** — `owner(e) = e // (E//P)`.
-Either works as long as every process computes it identically without
-communicating. Contiguous means the all-to-all split sizes fall straight out of a
-sort by destination, so the grouping is free. Round-robin can balance better if
-expert popularity correlates with index, but then you need an extra gather to make
-each destination's tokens contiguous.
-
-**`mp.spawn` rather than `torchrun`** — `torchrun` is the production launcher.
-`mp.spawn` means `python train.py` is the whole command, which matters more here
-than it would in production.
-
-**Evidence in the program output, not a test suite** — there is no `pytest`. The
-correctness check runs inside `train.py` on every invocation, so reproducing the
-results and verifying them are the same action, and a reviewer sees the number
-without running a second command. The cost is that it is not a regression check:
-nothing fails loudly if a later change breaks equivalence. For anything
-longer-lived this belongs in a test, alongside ones for the routing logic, the
-permutation round trip, and gradient equivalence per parameter.
-
-## Not done
-
-- Load-balancing auxiliary loss, per above.
-- Top-2 routing.
-- An EP × DP mesh. Right now expert parallelism spans the whole world. With data
-  parallelism on top you would build subgroups with `dist.new_group`, all-reduce
-  expert gradients down each DP column and the router across everything.
-- Overlapping the dispatch with expert compute.
-- Grouped GEMM. The per-expert Python loop is many small matmuls where one large
-  one would do. This is the first thing to fix for real performance.
-- Checkpointing. Sharded experts make saving and loading non-trivial.
-
-## Scaling
-
-`python bench.py` prints the full analysis. The short version:
-
-| | Formula | Behaviour |
-|---|---|---|
-| expert params per process | `(E/P)·2·d_model·d_ff` | falls as `1/P` |
-| FLOPs per token | `2k·2·d_model·d_ff` | **no `E` in it** |
-| all-to-all bytes per process | `≈2·T·k·d_model·b·(P−1)/P` | independent of `E`, bounded in `P` |
-| the all-reduce avoided | `2·(P−1)/P·E·2·d_model·d_ff·b` | grows linearly with `E` |
-
-Setting the last two equal, the ring factor and `d_model` cancel and you get
-`T* = 2·E·d_ff/k`. Below that many tokens per process, expert parallelism moves
-fewer bytes. At Mixtral-like sizes (`E=8, d_ff=14336, k=2`) that is about 115,000
-tokens per process, far more than anyone runs — so in practice it always wins on
-volume, and the real limits are latency and load balance.
-
-The table that makes the case is the sweep over `E`: raise it 16× and FLOPs per
-token and all-to-all bytes are both unchanged. Only parameters per process grow,
-and you add processes to absorb that.
-
-### On wall-clock
-
-More processes make this slower on one laptop. That is expected and worth being
-clear about. The processes time-slice the same cores, so there is no extra hardware
-being used. gloo over loopback has a fixed cost per message and these tensors are
-tiny, so the measurement is latency, never bandwidth. And the experts are small
-enough (`d_ff=32`) that there is no arithmetic to hide the transfer behind.
-
-On real GPUs the same code moves the same number of bytes over a much faster link,
-and the expert matmuls get big enough to overlap with the transfer. The byte counts
-above are hardware-independent; only the time to move them changes.

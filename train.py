@@ -10,7 +10,7 @@ evidence" deliverable:
 
     1. CORRECTNESS  — the distributed forward vs a single-process reference
     2. TRAINING     — loss decreasing over several steps
-    3. PARAMETERS   — router identical across ranks, experts legitimately not
+    3. PARAMETERS   — which numbers got shared between ranks, and which did not
 """
 
 import argparse
@@ -173,6 +173,7 @@ def worker(rank: int, world_size: int, args) -> None:
             print("  expert 5. That rank's gradient therefore already covers the entire")
             print("  batch — there is no missing piece on another rank to add in.")
             print("=" * 68, flush=True)
+
 
     finally:
         # Always tear down, including on the error path — otherwise a crash on
