@@ -54,25 +54,27 @@ class ExpertParallelMoE(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # 1) Route: Local
+        # Every rank needs its own router
         topk_idx, topk_gate, probs = self.router(x)
         assert self.cfg.top_k == 1, "expert-parallel forward only supports top_k == 1 for now"
 
-        # 2) Permute: Local
+        # 2) Rearrange: Local
         experts_per_rank = self.cfg.experts_per_rank(self.world_size)
-        dest = topk_idx[:, 0] // experts_per_rank      # which RANK owns each token's expert
+        dest = topk_idx[:, 0] // experts_per_rank     # find the destination rank for the chosen token
+
+        # sort the idx by the ascending order of the target rank
         order = torch.argsort(dest, stable=True)
-        inv = torch.argsort(order)                      # save: undoes this permutation in step 7
+        inv = torch.argsort(order)
         x_sorted = x[order]
         expert_id_sorted = topk_idx[:, 0][order]         # carried along so receivers know which local expert to run
 
         # 3) Counts: Communicate  -> Counts
-        send_counts = torch.bincount(dest, minlength=self.world_size)
-        recv_counts = exchange_counts(send_counts, self.group)
+        send_counts = torch.bincount(dest, minlength=self.world_size)  # count occurence per destination rank
+        recv_counts = exchange_counts(send_counts, self.group)         # exchange with other ranks
 
         # 4) Dispatch: Communicate -> The tokens
+        # in/out splits necessary as all_to_all sends everything contiguously so you need to know which segment you own?
         recv = all_to_all(x_sorted, recv_counts.tolist(), send_counts.tolist(), self.group)
-        # Option (a): a second all-to-all just for expert ids, alongside the tokens.
-        # Simpler to get right than deriving ids from sort order within each block (b).
         recv_expert_id = all_to_all(expert_id_sorted, recv_counts.tolist(), send_counts.tolist(), self.group)
 
         # 5) Compute Local Expert: Local 
