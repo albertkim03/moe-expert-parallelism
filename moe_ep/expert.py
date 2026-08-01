@@ -38,8 +38,8 @@ class Expert(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """ (n_tokens, d_model) -> (n_tokens, d_model) """
-        fc1_res = self.fc1(x)
-        act_res = self.act(fc1_res)
-        fc2_res = self.fc2(act_res)
+        x                              # input layer   — shape (d_model,)
+        h = self.act(self.fc1(x))      # hidden layer  — shape (d_ff,)
+        y = self.fc2(h)                # output layer  — shape (d_model,)
 
-        return fc2_res
+        return y

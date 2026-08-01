@@ -41,12 +41,3 @@ class Router(nn.Module):
             topk_gate = topk_gate / topk_sum
 
         return (topk_idx, topk_gate, probs)
-
-# TRADEOFF (time constraint)
-# Fight against routing collapse
-def load_balance_loss(
-    probs: torch.Tensor,
-    topk_idx: torch.Tensor,
-    num_experts: int,
-) -> torch.Tensor:
-    pass

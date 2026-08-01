@@ -93,14 +93,3 @@ class ExpertParallelMoE(nn.Module):
         return y, x.new_zeros(())
         
 
-    # ------------------------------------------------------------- helpers
-
-    @torch.no_grad()
-    def expert_load(self) -> torch.Tensor:
-        """(E,) how many tokens each expert saw this step, summed over all ranks.
-
-        TODO(step 10, nice-to-have): useful for showing routing shift over
-        training and for the "one expert got everything" discussion. Needs an
-        all_reduce(SUM) to be global.
-        """
-        raise NotImplementedError("TODO(step 10, optional): report expert load")
