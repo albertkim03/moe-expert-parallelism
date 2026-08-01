@@ -1,178 +1,268 @@
 # Expert Parallelism for MoE Training
 
-> **This README is a SKELETON.** The headings and prompts below are the structure
-> your submission should have — every `> _prompt_` line tells you what to write
-> there, then delete the prompt. The brief says *"We care about how you present
-> the idea as much as the code itself"*, so budget a full hour for this file.
->
-> Delete this blockquote before submitting.
+A Mixture-of-Experts layer with the experts split across processes. Each process
+holds only some of the experts, so a token whose expert lives elsewhere gets sent
+there, transformed, and sent back. Runs on CPU with `gloo`, no GPU needed.
 
----
+The point of the demo is to show that this produces exactly the same numbers as an
+ordinary single-process MoE, and to be precise about which gradients have to be
+shared between processes and which do not.
 
-## What this is
-
-> _One paragraph, no jargon, for a reader who has never heard of Mixture of
-> Experts. Roughly: "an MoE layer has many small feed-forward networks and a
-> router that sends each token to just one or two of them. Expert parallelism
-> puts different experts on different machines and ships each token to the
-> machine holding its expert. This repo demonstrates that on CPU with N
-> processes."_
-
-## Quick start
+## Run it
 
 ```bash
-./setup.sh      # creates .venv, installs pinned deps
-./run.sh        # tests + training demo + scaling analysis
+./setup.sh      # makes .venv, installs torch (~200MB)
+./run.sh        # training demo + scaling analysis
 ```
 
-> _Verify this works in a **fresh clone on a clean machine** before you submit.
-> "We will just want to reproduce your results on our own devices" — if the
-> first command fails, nothing else gets read._
-
-Individual pieces:
+Or the pieces separately:
 
 ```bash
-.venv/bin/python -m pytest tests/ -v
-.venv/bin/python train.py --ranks 4 --steps 10
-.venv/bin/python bench.py
+python train.py                  # 4 processes, 10 steps
+python train.py --ranks 8
+python bench.py                  # scaling numbers, no torch needed
 ```
 
-## The idea in one picture
+`train.py` starts the processes itself with `mp.spawn`, so there is no `torchrun`
+to remember. Tested on macOS (aarch64) and it has no platform-specific code.
 
-> _An ASCII diagram of dispatch → compute → combine. Something like the sketch
-> below, but make it yours and make it match your actual code._
+## What you get
+
+```
+1. CORRECTNESS  (distributed vs single-process reference)
+  global batch          : (48, 16)  (12 tokens on each of 4 ranks)
+  max |distributed-ref| : 0.000e+00
+  allclose(atol=1e-5)   : True
+
+2. TRAINING  (one MoE layer, regressing a constant)
+  step   0   loss 0.602845
+  step   4   loss 0.095551
+  step   9   loss 0.011927
+
+3. PARAMETERS  (what got all-reduced, and what did not)
+  replicated params / rank :    145   (router + head)  -> ALL-REDUCED
+  expert params / rank     :   2144   (2 experts)      -> NOT all-reduced
+
+  router spread across ranks: 0.000e+00
+    rank 0: owns experts [0, 1]   expert fingerprint +0.647167
+    rank 1: owns experts [2, 3]   expert fingerprint -10.233376
+    rank 2: owns experts [4, 5]   expert fingerprint +2.781003
+    rank 3: owns experts [6, 7]   expert fingerprint +7.785652
+```
+
+The delta is exactly zero at 1, 2, 4 and 8 processes. It is compared with a
+tolerance rather than for equality because reordered floating-point sums differ in
+the last bits; here the order happens to match, so it comes out exact.
+
+## The layer, step by step
 
 ```
         rank 0                                  rank 1
    ┌──────────────────┐                   ┌──────────────────┐
-   │ router (replica) │                   │ router (replica) │
+   │ router (copy)    │                   │ router (copy)    │
    │ experts E0, E1   │                   │ experts E2, E3   │
    └──────────────────┘                   └──────────────────┘
       tokens t0..t3                          tokens t4..t7
-            │  route locally                       │
+            │ 1. route locally                     │
             ▼                                      ▼
-       sort by destination rank              sort by destination rank
-            └──────────────┐   all-to-all   ┌──────────────┘
+       2. sort by destination rank           2. sort by destination rank
+       3. exchange counts  ◄─────────────────────► 3. exchange counts
+            └──────────────┐  4. all-to-all │──────────────┘
                            ▼   (dispatch)   ▼
               every token now sits on the rank that owns its expert
                            │                │
-                     E0,E1 forward     E2,E3 forward
-                           └──────────────┐ all-to-all
-                                          ▼ (combine)
-                        outputs return home, un-permute, × gate
+                    5. E0,E1 forward   5. E2,E3 forward
+                           └──────────────┐ 6. all-to-all
+                                          ▼   (combine)
+                      7. un-permute, multiply by the gate
 ```
 
-## Design
+Steps 4 and 6 are the same call with the split sizes swapped. That symmetry is also
+why the backward of one is the other.
 
-> _What you built and why it is shaped that way. Cover at least:_
->
-> - _Module layout and why the reference implementation exists separately_
-> - _Expert placement rule (`owner(e) = e // (E//P)`) and why contiguous_
-> - _Dropless vs capacity factor — which you chose and why_
-> - _How the token→expert-id mapping reaches the receiving rank_
-> - _Whether you wrote your own `autograd.Function` for the all-to-all or used
->   `torch.distributed.nn.functional`, and why_
-> - _Why `mp.spawn` rather than `torchrun` (or the reverse)_
+## Files
+
+| File | What it does |
+|---|---|
+| `config.py` | Settings, and the ownership rule. `owner_of(e)` is `e // (E//P)` — pure arithmetic, so every process independently agrees on who holds what without communicating. |
+| `router.py` | `router(x) -> (topk_idx, topk_gate, probs)`. Multiplies each token by a weight matrix to get one score per expert, softmaxes, takes the top-k. The gate is the winning probability. |
+| `expert.py` | `Linear(d_model, d_ff) -> ReLU -> Linear(d_ff, d_model)`. That is all an expert is. Tags its parameters `is_expert=True` at construction, which is what `sync.py` reads later. |
+| `reference_moe.py` | All `E` experts in one process, a plain loop over them. Deliberately the slowest possible version. Exists only as the thing to check the distributed version against. |
+| `distributed.py` | `setup`/`cleanup`, `exchange_counts`, and `all_to_all`. Knows nothing about experts. |
+| `ep_moe.py` | The expert-parallel layer. Holds `E/P` experts, runs the seven steps above. Same input and output shape as `reference_moe.py`. |
+| `model.py` | Wraps an MoE layer and adds `Linear(d_model, 1)` so there is one number per token to train against. `make_batch` gives each process different data. |
+| `sync.py` | After `backward()`, all-reduces the gradients of everything not tagged `is_expert`. Eight lines. |
+| `train.py` | Spawns the processes, builds the model, checks it against the reference, trains, prints the evidence above. |
+| `bench.py` | Scaling arithmetic. No torch, no processes. |
+
+Read them in that order; each only depends on the ones above it.
 
 ## What gets all-reduced, and what doesn't
 
-> _The brief names this explicitly, so give it its own section and be precise._
->
-> _The rule: **a parameter needs an all-reduce if and only if more than one rank
-> holds a copy of it.** Then work through it:_
->
-> | Parameter | Replicated or sharded | Synced? |
-> |---|---|---|
-> | router | replicated on every rank | all-reduce, ÷ world_size |
-> | experts | sharded, one owner each | **no sync** |
-> | head / other non-expert | replicated | all-reduce, ÷ world_size |
->
-> _Then the argument for why the expert gradient is already correct: the
-> dispatch all-to-all delivered every token in the world that chose expert `e`
-> onto `e`'s owner, so that rank's local gradient is already the sum over the
-> global batch. In data parallelism tokens stay put and gradients move; in
-> expert parallelism tokens move and gradients stay put._
->
-> _Mention the DDP trap — wrapping this model in `DistributedDataParallel`
-> silently averages the gradients of **different** experts across ranks._
+A parameter needs an all-reduce if and only if more than one process holds a copy
+of it.
 
-## Correctness
+| | Replicated? | Synced? |
+|---|---|---|
+| router | copy on every process | all-reduce |
+| output head | copy on every process | all-reduce |
+| experts | one owner each | **no sync** |
 
-> _Paste the actual output. Numbers, not adjectives._
->
-> - _Forward: distributed vs single-process reference, max |Δ| = ..._
-> - _Gradients: per-parameter max |Δ| = ..._
-> - _Router weights identical across ranks after N steps (max |Δ| = 0.0)_
-> - _Expert weights differ across ranks — **and why that is correct**_
-> - _Your tolerance choice and why_
+The router is the same parameter on all four processes, but each computed its
+gradient from different tokens. Left alone the four copies would drift apart and
+the processes would stop agreeing about where to send tokens. So they get summed.
+
+The experts do not need this, and the reason is worth stating carefully. The true
+gradient for expert `e` over the whole batch is a sum over every process, of the
+tokens on that process that chose `e`. In plain data parallelism each process
+computes its own inner sum and the all-reduce performs the outer one. Here the
+dispatch all-to-all has already moved all of those token sets onto `owner(e)`, so
+that one process computes both sums by itself. The all-to-all did the reduction.
+
+Put another way: in data parallelism the tokens stay put and the gradients move; in
+expert parallelism the tokens move and the gradients stay put. Either way the sum
+over the global batch happens.
+
+This is why `sync.py` is a loop with a `continue` in it rather than a call to
+`DistributedDataParallel`. DDP assumes every parameter is replicated. It would
+broadcast rank 0's weights at construction, destroying the sharding before the
+first step, and then all-reduce every gradient — averaging experts that are
+different parameters. Neither failure raises anything. The loss still goes down a
+little.
+
+## Tradeoffs
+
+**ReLU instead of GELU** (`expert.py`) — GELU is what modern transformers use,
+because ReLU zeroes the gradient for any negative input and a unit can get stuck
+there permanently. That matters in deep networks trained for a long time. This is a
+two-layer expert in a demo, so ReLU is one less thing to explain.
+
+**The built-in differentiable all-to-all instead of a hand-rolled
+`autograd.Function`** (`distributed.py`) — `torch.distributed.nn.functional.all_to_all_single`
+already implements the rule that the backward of an all-to-all is another
+all-to-all with the split sizes swapped, and it works on gloo. Writing it by hand
+is six lines and makes the rule visible to a reader, which is the argument for
+doing so. I would hand-roll it if I needed to change the behaviour, for example to
+overlap the transfer with expert compute.
+
+**No load-balancing auxiliary loss** (`reference_moe.py`, `ep_moe.py` — both return
+a zero for it) — this is the biggest omission and it is deliberate. Routing quality
+is orthogonal to whether the dispatch and combine are correct, which is what this
+POC is about. It matters more than usual under expert parallelism though: an
+overloaded expert means the process holding it does most of the work while the
+others wait at the next collective, so it is a throughput problem and not only a
+quality one. It is also not a drop-in addition. The Switch loss is
+`α·E·Σ fₑPₑ`, and `fₑ` is about the *global* token distribution, so the per-expert
+counts need their own `all_reduce(SUM)` before the loss is formed. Computed
+per-process, every process would optimise a different objective.
+
+**Top-1 routing only** (`ep_moe.py` asserts it) — top-2 is what Mixtral uses and it
+routes better, because the router sees a comparison rather than a single winner.
+Supporting it means each token becomes `k` rows before the dispatch and the `k`
+results are summed after the combine. That is a real complication and it is not
+where the marks are, so the assert turns an unsupported case into a loud failure
+instead of a silently wrong one.
+
+**Dropless, not a capacity factor** — buffers are sized from the real counts after
+the count exchange, so no token is ever discarded. A fixed capacity factor gives
+static shapes, which is what you want for `torch.compile`, CUDA graphs and
+fixed-size kernels, and it costs you dropped tokens. For a POC whose main claim is
+an exact match against a reference, dropping tokens would mean having to make the
+reference drop the same ones. Not worth it. I would switch for a production path.
+
+**A second all-to-all for the expert ids** (`ep_moe.py`) — the receiving process
+needs to know which of its experts each arriving token wants. Sending the ids
+alongside the tokens costs one extra collective carrying `T` int64s per layer,
+which is small next to the token payload. The alternative is to sort by expert id
+within each destination block so the receiver can derive the ids from the counts
+alone. That is what production implementations do. This way was easier to get
+right.
+
+**No `if mask.any()` guard around the expert call** — skipping the call when a
+process has no tokens for one of its experts would leave the output outside the
+autograd graph on that process. Its backward would then never run the all-to-all
+while every other process does, and the job hangs with no error. Calling an expert
+on zero rows is cheap and keeps every process's backward graph the same shape.
+
+**All `E` experts are constructed and then sliced** (`ep_moe.py.__init__`) — each
+process builds all eight and keeps its two. This wastes a little memory at init.
+It is done so that the RNG draws happen in the same order as in `reference_moe.py`,
+which makes rank `r`'s expert `e` bit-identical to the reference's expert `e` and
+turns the correctness check into two lines. A real implementation would construct
+only the local experts and seed them per-expert.
+
+**The loss is divided by the global token count, not the local one**
+(`train.py`) — this makes the per-process losses sum to the global mean loss, which
+is why `sync.py` can use a plain `SUM` all-reduce with no division afterwards. It is
+also what makes the expert gradients match a single-process run exactly rather than
+being off by a factor of `P`. If processes held different numbers of tokens, a plain
+mean would be wrong and you would weight by token count instead.
+
+**No bias on the router** (`router.py`) — a bias adds the same constant to an
+expert's score for every token. It can make an expert globally more or less popular
+but cannot help distinguish one token from another, which is the router's whole
+job. So it is a parameter that can only contribute to collapse.
+
+**Contiguous expert placement rather than round-robin** — `owner(e) = e // (E//P)`.
+Either works as long as every process computes it identically without
+communicating. Contiguous means the all-to-all split sizes fall straight out of a
+sort by destination, so the grouping is free. Round-robin can balance better if
+expert popularity correlates with index, but then you need an extra gather to make
+each destination's tokens contiguous.
+
+**`mp.spawn` rather than `torchrun`** — `torchrun` is the production launcher.
+`mp.spawn` means `python train.py` is the whole command, which matters more here
+than it would in production.
+
+**Evidence in the program output, not a test suite** — there is no `pytest`. The
+correctness check runs inside `train.py` on every invocation, so reproducing the
+results and verifying them are the same action, and a reviewer sees the number
+without running a second command. The cost is that it is not a regression check:
+nothing fails loudly if a later change breaks equivalence. For anything
+longer-lived this belongs in a test, alongside ones for the routing logic, the
+permutation round trip, and gradient equivalence per parameter.
+
+## Not done
+
+- Load-balancing auxiliary loss, per above.
+- Top-2 routing.
+- An EP × DP mesh. Right now expert parallelism spans the whole world. With data
+  parallelism on top you would build subgroups with `dist.new_group`, all-reduce
+  expert gradients down each DP column and the router across everything.
+- Overlapping the dispatch with expert compute.
+- Grouped GEMM. The per-expert Python loop is many small matmuls where one large
+  one would do. This is the first thing to fix for real performance.
+- Checkpointing. Sharded experts make saving and loading non-trivial.
 
 ## Scaling
 
-> _The brief pre-excuses wall-clock, so lead with the analysis._
->
-> _Give the closed-form model:_
->
-> - _expert params per rank = `(E/P) · 2 · d_model · d_ff` → falls as 1/P_
-> - _FLOPs per token = `2 · k · 2 · d_model · d_ff` → **independent of E**_
-> - _all-to-all bytes per rank ≈ `2 · T · k · d_model · bytes` → flat in P and E_
-> - _the all-reduce you avoided = `2(P−1)/P · E · 2 · d_model · d_ff · bytes` → **grows with E**_
->
-> _Then the crossover: set the last two equal and solve for T. Report the number
-> for your config — that is the actual insight._
->
-> _Then the measured table from `bench.py`, and an honest paragraph on why
-> laptop timings get worse with more ranks (P processes time-slicing the same
-> cores; gloo over loopback is latency-bound at these tensor sizes; tiny experts
-> mean no compute to hide the transfer behind). Explaining bad numbers well beats
-> omitting them._
+`python bench.py` prints the full analysis. The short version:
 
-## Tradeoffs and limitations
+| | Formula | Behaviour |
+|---|---|---|
+| expert params per process | `(E/P)·2·d_model·d_ff` | falls as `1/P` |
+| FLOPs per token | `2k·2·d_model·d_ff` | **no `E` in it** |
+| all-to-all bytes per process | `≈2·T·k·d_model·b·(P−1)/P` | independent of `E`, bounded in `P` |
+| the all-reduce avoided | `2·(P−1)/P·E·2·d_model·d_ff·b` | grows linearly with `E` |
 
-> _The section people skip. Do not skip it — naming your own limits reads as
-> senior. Be specific about:_
->
-> - _What you did not implement (top-k > 1? EP×DP mesh? capacity factor?)_
-> - _Where this breaks: load imbalance and stragglers; all-to-all across slow
->   inter-node links; batch sizes large enough that activation traffic exceeds
->   the gradient traffic you avoided_
-> - _What you would do with another day_
+Setting the last two equal, the ring factor and `d_model` cancel and you get
+`T* = 2·E·d_ff/k`. Below that many tokens per process, expert parallelism moves
+fewer bytes. At Mixtral-like sizes (`E=8, d_ff=14336, k=2`) that is about 115,000
+tokens per process, far more than anyone runs — so in practice it always wins on
+volume, and the real limits are latency and load balance.
 
-## Extending at scale
+The table that makes the case is the sweep over `E`: raise it 16× and FLOPs per
+token and all-to-all bytes are both unchanged. Only parameters per process grow,
+and you add processes to absorb that.
 
-> _They said the follow-up digs into "how the approach would extend at scale".
-> Have written answers ready for:_
->
-> - _EP × DP meshes, and which group each collective runs in_
-> - _Composing with FSDP/ZeRO and tensor parallelism, and the ordering
->   convention (EP nearest the fast interconnect)_
-> - _Overlapping the all-to-all with expert compute_
-> - _Grouped GEMM / MegaBlocks-style block-sparse kernels instead of a Python
->   loop over experts_
-> - _What changes for inference rather than training_
+### On wall-clock
 
-## Repo layout
+More processes make this slower on one laptop. That is expected and worth being
+clear about. The processes time-slice the same cores, so there is no extra hardware
+being used. gloo over loopback has a fixed cost per message and these tensors are
+tiny, so the measurement is latency, never bandwidth. And the experts are small
+enough (`d_ff=32`) that there is no arithmetic to hide the transfer behind.
 
-```
-moe_ep/
-  config.py          knobs (provided complete)
-  expert.py          one expert = one small feed-forward network
-  router.py          gating network: logits → softmax → top-k, + aux loss
-  reference_moe.py   the whole layer in ONE process — the source of truth
-  distributed.py     process groups, count exchange, differentiable all-to-all
-  ep_moe.py          the same layer with experts sharded across ranks
-  sync.py            which gradients get all-reduced, and which do not
-  model.py           tiny model wrapping the MoE layer so it can be trained
-train.py             the demo entry point
-bench.py             scaling numbers
-tests/
-  conftest.py        multi-process test harness (provided complete)
-  test_routing.py    single-process routing logic
-  test_equivalence.py distributed forward == reference
-  test_gradients.py  the all-reduce rules, demonstrated
-```
-
-## Notes for whoever reads this next
-
-> _Optional, but a nice touch given they said they may share the codebase
-> internally. A short "if you want to understand this in 10 minutes, read these
-> three files in this order" pointer._
+On real GPUs the same code moves the same number of bytes over a much faster link,
+and the expert matmuls get big enough to overlap with the transfer. The byte counts
+above are hardware-independent; only the time to move them changes.

@@ -31,7 +31,7 @@ class Expert(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(d_model, d_ff, bias=True)
         self.fc2 = nn.Linear(d_ff, d_model, bias=True)
-        self.act = nn.ReLU()
+        self.act = nn.ReLU() # TRADEOFF
 
         for p in self.parameters():
             p.is_expert = True
