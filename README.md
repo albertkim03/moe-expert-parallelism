@@ -11,7 +11,7 @@ shared between processes and which do not.
 ## Run it
 
 ```bash
-./setup.sh      # makes .venv, installs torch (~200MB)
+./setup.sh      # makes .venv, installs torch 
 ./run.sh        # the training demo
 ```
 
