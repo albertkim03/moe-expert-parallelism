@@ -44,16 +44,36 @@ python bench.py                  # scaling numbers, no torch needed
   step   4   loss 0.095551
   step   9   loss 0.011927
 
-3. PARAMETERS  (what got all-reduced, and what did not)
-  replicated params / rank :    145   (router + head)  -> ALL-REDUCED
-  expert params / rank     :   2144   (2 experts)      -> NOT all-reduced
+3. PARAMETERS   (which numbers had to be shared between ranks?)
+  Each rank holds 2289 learnable numbers, in two groups.
 
-  router spread across ranks: 0.000e+00
-    rank 0: owns experts [0, 1]   expert fingerprint +0.647167
-    rank 1: owns experts [2, 3]   expert fingerprint -10.233376
-    rank 2: owns experts [4, 5]   expert fingerprint +2.781003
-    rank 3: owns experts [6, 7]   expert fingerprint +7.785652
+  GROUP 1 — the router and the output layer        145 numbers
+    Every rank holds the SAME numbers here: they are copies of one thing.
+    Each computed a different gradient, because each saw different tokens,
+    so the gradients were added up across ranks. If that worked, all
+    copies are still identical:
+
+      biggest disagreement between ranks : 0   (identical, as intended)
+
+  GROUP 2 — the experts                           2144 numbers   (2 of the 8)
+    Every rank holds DIFFERENT numbers here. Rank 0 has experts 0 and 1;
+    rank 1 has 2 and 3. Not copies, so nothing to add them up with. They
+    were left alone, and they should NOT match:
+
+      rank 0  owns experts [0, 1]  its 2144 numbers add up to   +0.647167
+      rank 1  owns experts [2, 3]  its 2144 numbers add up to  -10.233376
+      rank 2  owns experts [4, 5]  its 2144 numbers add up to   +2.781003
+      rank 3  owns experts [6, 7]  its 2144 numbers add up to   +7.785652
 ```
+
+The numbers that should be identical are, and the numbers that should differ do.
+That is the whole claim, and it is one command away from being reproduced.
+
+Where the counts come from: the router weight is 8 experts x 16 inputs = 128
+numbers, plus the output layer's 16 weights and 1 bias = 145. One expert is two
+weight matrices and two bias vectors = 1072 numbers, and each rank holds 2 of them
+= 2144. Across all four ranks that is 145 shared numbers plus 8576 distinct expert
+numbers.
 
 Every one of the 768 numbers matches, at 1, 2, 4 and 8 processes.
 

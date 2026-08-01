@@ -65,24 +65,29 @@ def check_parameter_health(model: nn.Module, rank: int, world_size: int, group=N
 
       2. Expert parameters DIFFER across ranks — and that is CORRECT, not a bug.
          Rank 0 holds E0/E1 and rank 1 holds E2/E3; they are different
-         parameters, not disagreeing copies of one parameter. The fingerprint
-         below is just a cheap scalar summary so the difference is visible in
-         printed output.
+         parameters, not disagreeing copies of one parameter. Adding up each
+         rank's expert numbers gives one value per rank that is easy to eyeball;
+         they differ, and that is the intended result.
     """
+    # Collect every rank's copy of the router weight, then measure the biggest
+    # disagreement between them, element by element. Should be 0.
     w = model.moe.router.gate.weight
     gathered = torch.empty(world_size, *w.shape)
     dist.all_gather_into_tensor(gathered, w.unsqueeze(0).contiguous(), group=group)
-    router_spread = (gathered - gathered[0]).abs().max().item()
+    biggest_disagreement = (gathered.max(dim=0).values - gathered.min(dim=0).values).max().item()
 
     return {
-        "router_spread_across_ranks": router_spread,
-        "n_replicated_params": sum(
+        # how far apart the replicated copies have drifted — want exactly 0
+        "replicated_disagreement": biggest_disagreement,
+        "n_replicated": sum(
             p.numel() for p in model.parameters() if not getattr(p, "is_expert", False)
         ),
-        "n_expert_params": sum(
+        "n_expert": sum(
             p.numel() for p in model.parameters() if getattr(p, "is_expert", False)
         ),
         "local_expert_ids": list(model.moe.local_expert_ids),
-        # a scalar summary of this rank's own experts — differs per rank, by design
-        "expert_fingerprint": sum(p.sum().item() for p in model.moe.experts.parameters()),
+        # Adding up this rank's expert numbers gives a single value that is easy
+        # to eyeball. It differs per rank BY DESIGN — these are different
+        # experts, not copies of the same one.
+        "expert_weight_sum": sum(p.sum().item() for p in model.moe.experts.parameters()),
     }

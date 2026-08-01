@@ -53,7 +53,7 @@ def correctness_check(cfg: MoEConfig, model, rank: int, world_size: int) -> None
     T = cfg.tokens_per_rank
     torch.manual_seed(cfg.seed)
     reference = ReferenceMoE(cfg)
-
+    
     torch.manual_seed(1234)  # same on every rank -> same global batch
     x_global = torch.randn(world_size * T, cfg.d_model)
     x_local = x_global[rank * T : (rank + 1) * T]
@@ -131,34 +131,47 @@ def worker(rank: int, world_size: int, args) -> None:
 
         # -------------------------------------------------------- parameters
         health = check_parameter_health(model, rank, world_size)
+        n_rep, n_exp = health["n_replicated"], health["n_expert"]
+        per_rank = cfg.num_experts // world_size
+
         if rank == 0:
             print()
             print("=" * 68)
-            print("3. PARAMETERS  (what got all-reduced, and what did not)")
+            print("3. PARAMETERS   (which numbers had to be shared between ranks?)")
             print("=" * 68)
-            print(f"  replicated params / rank : {health['n_replicated_params']:>6}"
-                  "   (router + head)  -> ALL-REDUCED")
-            print(f"  expert params / rank     : {health['n_expert_params']:>6}"
-                  f"   ({cfg.num_experts // world_size} experts)   -> NOT all-reduced")
-            print()
-            print(f"  router spread across ranks: {health['router_spread_across_ranks']:.3e}"
-                  "   <- replicas never drift", flush=True)
+            print(f"  Each rank holds {n_rep + n_exp} learnable numbers, in two groups.\n")
+
+            print(f"  GROUP 1 — the router and the output layer      {n_rep:>5} numbers")
+            print("    Every rank holds the SAME numbers here: they are copies of one")
+            print("    thing. Each rank computed a different gradient for them, because")
+            print("    each saw different tokens. So the gradients were added up across")
+            print("    ranks. If that worked, all copies are still identical:\n")
+            drift = health["replicated_disagreement"]
+            verdict = "0   (identical, as intended)" if drift == 0 else f"{drift:.3e}   (they drifted!)"
+            print(f"      biggest disagreement between ranks : {verdict}\n")
+
+            print(f"  GROUP 2 — the experts                          {n_exp:>5} numbers"
+                  f"   ({per_rank} of the {cfg.num_experts} experts)")
+            print("    Every rank holds DIFFERENT numbers here. Rank 0 has experts 0 and")
+            print("    1; rank 1 has 2 and 3. They are not copies, so there is nothing to")
+            print("    add them up with. They were left alone, and they should NOT match:\n",
+                  flush=True)
 
         ordered_print(
             rank, world_size,
-            f"    rank {rank}: owns experts {health['local_expert_ids']}   "
-            f"expert fingerprint {health['expert_fingerprint']:+.6f}",
+            f"      rank {rank}  owns experts {str(health['local_expert_ids']):<8}"
+            f"its {n_exp} numbers add up to {health['expert_weight_sum']:>+11.6f}",
         )
 
         if rank == 0:
             print()
-            print("  The router is ONE parameter copied on every rank, so its gradient is")
-            print("  averaged and the copies stay bit-identical (spread = 0 above).")
+            print("  So: the numbers that SHOULD be identical are, and the numbers that")
+            print("  SHOULD differ do.")
             print()
-            print("  The experts DIFFER across ranks, and that is correct — they are")
-            print("  different parameters, not disagreeing copies of one parameter. Each")
-            print("  expert's gradient is already the global one, because the dispatch")
-            print("  all-to-all delivered it every token in the world that chose it.")
+            print("  Why the experts need no sharing: the dispatch all-to-all already sent")
+            print("  every token in the whole job that chose expert 5 to the rank holding")
+            print("  expert 5. That rank's gradient therefore already covers the entire")
+            print("  batch — there is no missing piece on another rank to add in.")
             print("=" * 68, flush=True)
 
     finally:
