@@ -53,11 +53,11 @@ class ExpertParallelMoE(nn.Module):
         self.experts = nn.ModuleList([all_experts[i] for i in self.local_expert_ids])
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # --- 1. route (local, no communication) ---------------------------
+        # 1) Route: Local
         topk_idx, topk_gate, probs = self.router(x)
         assert self.cfg.top_k == 1, "expert-parallel forward only supports top_k == 1 for now"
 
-        # --- 2. permute ------------------------------------------------------
+        # 2) Permute: Local
         experts_per_rank = self.cfg.experts_per_rank(self.world_size)
         dest = topk_idx[:, 0] // experts_per_rank      # which RANK owns each token's expert
         order = torch.argsort(dest, stable=True)
@@ -65,23 +65,23 @@ class ExpertParallelMoE(nn.Module):
         x_sorted = x[order]
         expert_id_sorted = topk_idx[:, 0][order]         # carried along so receivers know which local expert to run
 
-        # --- 3. counts ---------------------------------------------------------
+        # 3) Counts: Communicate  -> Counts
         send_counts = torch.bincount(dest, minlength=self.world_size)
         recv_counts = exchange_counts(send_counts, self.group)
 
-        # --- 4. dispatch ------------------------------------------------------
+        # 4) Dispatch: Communicate -> The tokens
         recv = all_to_all(x_sorted, recv_counts.tolist(), send_counts.tolist(), self.group)
         # Option (a): a second all-to-all just for expert ids, alongside the tokens.
         # Simpler to get right than deriving ids from sort order within each block (b).
         recv_expert_id = all_to_all(expert_id_sorted, recv_counts.tolist(), send_counts.tolist(), self.group)
 
-        # --- 5. local expert compute -------------------------------------------
+        # 5) Compute Local Expert: Local 
         out = torch.zeros_like(recv)
         for local_i, global_id in enumerate(self.local_expert_ids):
             mask = recv_expert_id == global_id
             out[mask] = self.experts[local_i](recv[mask])   # empty mask -> 0-row matmul, handled fine
 
-        # --- 6. combine ---------------------------------------------------------
+        # 6) Combine: Communicate -> The results
         back = all_to_all(out, send_counts.tolist(), recv_counts.tolist(), self.group)  # splits swapped
 
         # --- 7. un-permute and scale ---------------------------------------------

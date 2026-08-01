@@ -65,27 +65,6 @@ python train.py --ranks 8
       rank 3  owns experts [6, 7]  its 2144 numbers add up to   +7.785652
 ```
 
-The numbers that should be identical are, and the numbers that should differ do.
-That is the whole claim, and it is one command away from being reproduced.
-
-Where the counts come from: the router weight is 8 experts x 16 inputs = 128
-numbers, plus the output layer's 16 weights and 1 bias = 145. One expert is two
-weight matrices and two bias vectors = 1072 numbers, and each rank holds 2 of them
-= 2144. Across all four ranks that is 145 shared numbers plus 8576 distinct expert
-numbers.
-
-Every one of the 768 numbers matches, at 1, 2, 4 and 8 processes.
-
-That comparison is the point of `reference_moe.py` existing. Get the distributed
-version wrong — send a token to the wrong process, or reassemble the answers in the
-wrong order — and you get plausible numbers in the wrong places. Same shape, same
-magnitude, no error raised, and the loss still falls. Subtracting against an
-implementation simple enough to verify by reading is the only way to see it.
-
-An exact match is slightly lucky. Floating-point addition is not associative, so
-summing the same values in a different order can differ in the last bits; here the
-order happens to line up. A difference of ~1e-6 would still be a pass.
-
 ## The layer, step by step
 
 ```
