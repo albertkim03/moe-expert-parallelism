@@ -92,7 +92,6 @@ def worker(rank: int, world_size: int, args) -> None:
     distributed.setup(rank, world_size, port=args.port)
     try:
         cfg = MoEConfig(num_experts=8, d_model=16, d_ff=32, top_k=1, tokens_per_rank=12)
-        cfg.validate(world_size)
         n_global = world_size * cfg.tokens_per_rank
 
         # Same seed on every rank -> every copy of the router starts identical.

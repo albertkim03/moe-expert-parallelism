@@ -28,8 +28,10 @@ import torch.distributed.nn.functional as dist_nn
 def setup(rank: int, world_size: int, port: int = 29500, backend: str = "gloo") -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1" # machine
     os.environ["MASTER_PORT"] = str(port)   # network port
+
+    #initialise when world_size = world_size: otherwise cannot start
     dist.init_process_group(backend, rank=rank, world_size=world_size)
-    torch.set_num_threads(1)
+    torch.set_num_threads(1) # strict limit from 8 threads
 
 def cleanup() -> None:
     dist.destroy_process_group()
@@ -42,11 +44,7 @@ def exchange_counts(send_counts: torch.Tensor, group=None) -> torch.Tensor:
     dist.all_to_all_single(recv_counts, send_counts, group=group)
     return recv_counts
 
-# TRADEOFF
 def all_to_all(x, out_splits, in_splits, group=None):
-    """Send/receive token blocks between ranks. Uses the built-in differentiable
-    all-to-all rather than a hand-rolled autograd.Function — see README for why.
-    """
     out = torch.empty(sum(out_splits), *x.shape[1:], dtype=x.dtype)
     return dist_nn.all_to_all_single(out, x.contiguous(), out_splits, in_splits, group=group)
 

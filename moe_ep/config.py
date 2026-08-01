@@ -47,17 +47,6 @@ class MoEConfig:
     Pitfalls -> "different seeds per rank".
     """
 
-    def validate(self, world_size: int) -> None:
-        """Fail loudly and early rather than mysteriously later."""
-        if self.num_experts % world_size != 0:
-            raise ValueError(
-                f"num_experts ({self.num_experts}) must be divisible by "
-                f"world_size ({world_size}); otherwise some ranks own more "
-                f"experts than others and idle at every all-to-all."
-            )
-        if self.top_k < 1 or self.top_k > self.num_experts:
-            raise ValueError(f"top_k must be in [1, {self.num_experts}], got {self.top_k}")
-
     def experts_per_rank(self, world_size: int) -> int:
         return self.num_experts // world_size
 

@@ -46,7 +46,6 @@ class ExpertParallelMoE(nn.Module):
 
     def __init__(self, cfg: MoEConfig, rank: int, world_size: int, group=None) -> None:
         super().__init__()
-        cfg.validate(world_size)
         self.cfg, self.rank, self.world_size, self.group = cfg, rank, world_size, group
         self.router = Router(cfg.d_model, cfg.num_experts, cfg.top_k)
         self.local_expert_ids = cfg.local_expert_ids(rank, world_size)

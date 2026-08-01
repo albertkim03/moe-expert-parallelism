@@ -31,7 +31,7 @@ class Router(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         # Score experts
-        logits = self.gate(x)                                   # (T, E)
+        logits = self.gate(x)                                   # (T, E) | matvec
         probs = torch.softmax(logits, dim=-1)                   # (T, E) | normalize each token's scores into a distribution over experts, summing to 1
         topk_gate, topk_idx = probs.topk(self.top_k, dim=-1)    # (T, k)
 

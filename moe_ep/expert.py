@@ -29,10 +29,12 @@ class Expert(nn.Module):
 
     def __init__(self, d_model: int, d_ff: int) -> None:
         super().__init__()
+        # 2 fully connected layers
         self.fc1 = nn.Linear(d_model, d_ff, bias=True)
         self.fc2 = nn.Linear(d_ff, d_model, bias=True)
         self.act = nn.ReLU() # TRADEOFF
 
+        # tag to prevent it from being all-reduced later
         for p in self.parameters():
             p.is_expert = True
 
